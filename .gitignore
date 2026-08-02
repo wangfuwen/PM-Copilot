@@ -1,0 +1,41 @@
+# secrets
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
+frontend/.env*.local
+
+# dependencies
+node_modules/
+frontend/node_modules/
+backend/.venv/
+.venv/
+venv/
+
+# build / cache
+frontend/.next/
+frontend/out/
+dist/
+build/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local vector / profile data
+backend/chroma_data/
+chroma_data/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# misc
+.prd_extract.txt
+*.log
