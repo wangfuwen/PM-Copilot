@@ -21,6 +21,8 @@ from app.graph.workflow import (
     build_workflow,
     route_after_orchestrator,
     route_after_org_memory,
+    route_after_decision,
+    route_after_critic,
 )
 
 
@@ -106,6 +108,16 @@ class TestWorkflow:
         assert route_after_org_memory({"next_agent": "stress_test"}) == "stress_test"
         assert route_after_org_memory({"next_agent": "unknown"}) == "decision"
 
+    def test_route_after_decision_clarify_or_continue(self):
+        assert route_after_decision({"awaiting_clarification": True}) == "end"
+        assert route_after_decision({"requested_phase": "decision"}) == "end"
+        assert route_after_decision({"requested_phase": "auto"}) == "prd_writer"
+        assert route_after_decision({"requested_phase": "full_pipeline"}) == "prd_writer"
+
+    def test_route_after_critic(self):
+        assert route_after_critic({"skip_stress": True}) == "stress_test"
+        assert route_after_critic({"demo_mode": True}) == "stress_test"
+
 
 # ──────────────────────────────────────────────
 # Agent Tests (mocked LLM)
@@ -138,11 +150,65 @@ class TestAgents:
 }
 ```
 """)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
 
         agent = DecisionAgent(llm=mock_llm)
         result = await agent.analyze("Build a new feature")
         assert result.recommendation == "GO"
         assert result.confidence == 0.9
+
+    def test_progressive_clarify_qa_and_skip(self):
+        from app.agents.decision import (
+            DecisionAgent,
+            CLARIFY_MARKER,
+            format_clarify_step,
+            MAX_CLARIFY_STEPS,
+        )
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        step = {
+            "mode": "clarify_step",
+            "step": 1,
+            "max_steps": MAX_CLARIFY_STEPS,
+            "id": "who_pays",
+            "question": "主要付费方是谁？",
+            "options": [
+                {"id": "b2c", "label": "个人用户付费"},
+                {"id": "b2b", "label": "企业采购"},
+            ],
+            "allow_custom": True,
+        }
+        clarify_msg = format_clarify_step(step)
+        assert CLARIFY_MARKER in clarify_msg
+
+        unanswered = [
+            HumanMessage(content="做一个 AI 笔记应用"),
+            AIMessage(content=clarify_msg),
+        ]
+        assert DecisionAgent._last_unanswered_clarify(unanswered) is not None
+        assert DecisionAgent._extract_qa_pairs(unanswered) == []
+
+        answered = unanswered + [HumanMessage(content="个人用户付费")]
+        assert DecisionAgent._last_unanswered_clarify(answered) is None
+        pairs = DecisionAgent._extract_qa_pairs(answered)
+        assert len(pairs) == 1
+        assert pairs[0]["answer"] == "个人用户付费"
+        assert DecisionAgent._is_skip_answer("__SKIP_CLARIFY__") is True
+        assert DecisionAgent._is_skip_answer("跳过，直接决策") is True
+        assert DecisionAgent._is_skip_answer("个人用户付费") is False
+
+    def test_normalize_clarify_step_fallback(self):
+        from app.agents.decision import DecisionAgent
+
+        out = DecisionAgent._normalize_step({"action": "ask"}, step=1)
+        assert out["action"] == "ask"
+        assert out["question"]
+        assert len(out["options"]) >= 2
+
+        decide = DecisionAgent._normalize_step(
+            {"action": "decide", "reason": "enough"}, step=1
+        )
+        assert decide["action"] == "decide"
 
     @pytest.mark.asyncio
     async def test_stress_test_agent(self, mock_llm):

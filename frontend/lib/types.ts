@@ -41,18 +41,61 @@ export interface MemoryCitation {
   preview?: string;
 }
 
+export interface ClarifyOption {
+  id: string;
+  label: string;
+}
+
+/** Single progressive clarify step (Cursor-style). */
+export interface ClarifyStep {
+  mode?: string;
+  step?: number;
+  max_steps?: number;
+  id?: string;
+  question: string;
+  options: ClarifyOption[];
+  allow_custom?: boolean;
+  hint?: string;
+}
+
+/** @deprecated Use ClarifyStep — kept for transitional typing */
+export type ClarifyingQuestions = ClarifyStep;
+
+export interface CriticFeedback {
+  score?: number;
+  verdict?: string;
+  strengths?: string[];
+  improvements?: string[];
+  summary?: string;
+  review?: string;
+}
+
 export interface AgentOutput {
   decision?: DecisionOutput;
   prd?: string;
   stressTest?: StressTestChallenge[];
   stressTestSummary?: StressTestSummary;
   citations?: MemoryCitation[];
+  clarifying_questions?: ClarifyStep;
+  awaiting_clarification?: boolean;
+  critic?: CriticFeedback;
+  memory_empty?: boolean;
   org_profile_summary?: {
     terminology?: Record<string, string>;
     lessons_count?: number;
     review_focus?: string[];
   };
   writeback_ids?: string[];
+}
+
+export interface MemoryChunk {
+  chunk_id: string;
+  doc_id: string;
+  title: string;
+  doc_type: string;
+  section_title?: string;
+  content: string;
+  metadata?: Record<string, unknown>;
 }
 
 // ──────────────────────────────────────────────
@@ -121,7 +164,13 @@ export interface ChatSession {
 // SSE Event Types
 // ──────────────────────────────────────────────
 
-export type SSEEventType = "agent_start" | "agent_output" | "agent_complete" | "done" | "error";
+export type SSEEventType =
+  | "ping"
+  | "agent_start"
+  | "agent_output"
+  | "agent_complete"
+  | "done"
+  | "error";
 
 export interface SSEEvent {
   type: SSEEventType;
@@ -130,6 +179,9 @@ export interface SSEEvent {
     session_id?: string;
     output?: AgentOutput;
     agents_executed?: AgentName[];
+    rate_limit_remaining?: number;
+    demo_mode?: boolean;
+    message?: string;
     [key: string]: unknown;
   };
 }

@@ -7,11 +7,13 @@ import {
   deleteMemoryDoc,
   getOrgProfile,
   rebuildOrgProfile,
+  getMemoryChunk,
 } from "@/lib/api";
-import type { MemoryCitation, MemoryDoc, OrgProfile } from "@/lib/types";
+import type { MemoryCitation, MemoryChunk, MemoryDoc, OrgProfile } from "@/lib/types";
 
 interface MemoryPanelProps {
   citations?: MemoryCitation[];
+  memoryEmpty?: boolean;
 }
 
 const DOC_TYPES = [
@@ -22,7 +24,7 @@ const DOC_TYPES = [
   { value: "other", label: "其他" },
 ];
 
-export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
+export function MemoryPanel({ citations = [], memoryEmpty = false }: MemoryPanelProps) {
   const [docs, setDocs] = useState<MemoryDoc[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
   const [profile, setProfile] = useState<OrgProfile | null>(null);
@@ -33,6 +35,8 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [showProfile, setShowProfile] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
+  const [preview, setPreview] = useState<MemoryChunk | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,6 +56,23 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const openCitation = async (c: MemoryCitation) => {
+    if (!c.chunk_id) {
+      setError("该引用缺少 chunk_id，无法打开原文");
+      return;
+    }
+    setPreviewLoading(true);
+    setError(null);
+    try {
+      const chunk = await getMemoryChunk(c.chunk_id);
+      setPreview(chunk);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
 
   const handleUpload = async () => {
     if (!title.trim() || !content.trim()) {
@@ -111,6 +132,8 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
 
   const mapping = profile?.terminology?.mapping || {};
   const lessons = profile?.lessons_learned || [];
+  const isEmptyKb =
+    memoryEmpty || Number(stats.document_count ?? docs.length) === 0;
 
   return (
     <div className="space-y-3 text-xs">
@@ -118,7 +141,7 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
         <div>
           <h3 className="text-xs font-semibold text-foreground">组织记忆</h3>
           <p className="text-[11px] text-muted-foreground">
-            文档 {Number(stats.document_count ?? docs.length)} · 切片{" "}
+            仅上传入库 · 文档 {Number(stats.document_count ?? docs.length)} · 切片{" "}
             {Number(stats.chunk_count ?? 0)}
           </p>
         </div>
@@ -140,6 +163,12 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
         </div>
       </div>
 
+      {isEmptyKb && (
+        <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-200">
+          知识库为空：Agent 将在无组织上下文下运行。请上传历史 PRD / 复盘以启用 RAG。
+        </div>
+      )}
+
       {error && (
         <div className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
           {error}
@@ -147,23 +176,37 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
       )}
 
       {citations.length > 0 && (
-        <div className="rounded border border-border bg-secondary/40 p-2">
-          <p className="mb-1 font-medium text-foreground">本次检索引用</p>
-          <ul className="space-y-1">
-            {citations.slice(0, 5).map((c, i) => (
-              <li key={c.chunk_id || `${c.doc_id}-${i}`} className="text-muted-foreground">
-                <span className="text-foreground">
-                  [{c.index ?? i + 1}] {c.title || "Untitled"}
-                </span>
-                {typeof c.score === "number" && (
-                  <span className="ml-1">({c.score.toFixed(2)})</span>
-                )}
-                {c.preview && (
-                  <div className="truncate text-[10px] opacity-80">{c.preview}</div>
-                )}
-              </li>
-            ))}
-          </ul>
+        <CitationSideList
+          citations={citations}
+          onOpen={openCitation}
+          busy={previewLoading}
+        />
+      )}
+
+      {preview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="max-h-[80vh] w-full max-w-lg overflow-hidden rounded-lg border border-border bg-card shadow-xl">
+            <div className="flex items-start justify-between border-b border-border px-4 py-3">
+              <div className="min-w-0 pr-3">
+                <h4 className="truncate text-sm font-semibold text-foreground">
+                  {preview.title}
+                </h4>
+                <p className="text-[11px] text-muted-foreground">
+                  {preview.doc_type}
+                  {preview.section_title ? ` · ${preview.section_title}` : ""}
+                </p>
+              </div>
+              <button
+                onClick={() => setPreview(null)}
+                className="rounded border border-border px-2 py-1 text-[11px] hover:bg-accent"
+              >
+                关闭
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap px-4 py-3 text-xs leading-relaxed text-foreground">
+              {preview.content}
+            </div>
+          </div>
         </div>
       )}
 
@@ -277,6 +320,68 @@ export function MemoryPanel({ citations = [] }: MemoryPanelProps) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Side-panel citation list: muted, collapsed by default, click to open source. */
+function CitationSideList({
+  citations,
+  onOpen,
+  busy,
+}: {
+  citations: MemoryCitation[];
+  onOpen: (c: MemoryCitation) => void;
+  busy: boolean;
+}) {
+  const [collapsed, setCollapsed] = useState(true);
+  const items = (() => {
+    const map = new Map<string, MemoryCitation>();
+    for (const c of citations) {
+      const key = c.doc_id || c.chunk_id || c.title || "";
+      const prev = map.get(key);
+      if (!prev || (c.score ?? 0) > (prev.score ?? 0)) map.set(key, c);
+    }
+    return Array.from(map.values())
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .slice(0, 5);
+  })();
+
+  return (
+    <div className="rounded border border-border/60 bg-muted/20 p-2 text-muted-foreground">
+      <button
+        type="button"
+        onClick={() => setCollapsed((v) => !v)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="font-medium text-foreground/80">
+          本次引用 · {items.length}
+        </span>
+        <span className="text-[10px]">{collapsed ? "展开" : "收起"}</span>
+      </button>
+      {!collapsed && (
+        <ul className="mt-1.5 space-y-1 border-t border-border/40 pt-1.5">
+          {items.map((c, i) => (
+            <li key={c.chunk_id || `${c.doc_id}-${i}`}>
+              <button
+                type="button"
+                onClick={() => onOpen(c)}
+                className="w-full text-left hover:text-foreground"
+                disabled={busy}
+              >
+                <span className="text-foreground/90 underline-offset-2 hover:underline">
+                  [{i + 1}] {c.title || "Untitled"}
+                </span>
+                {typeof c.score === "number" && (
+                  <span className="ml-1 text-[10px]">
+                    ({(c.score * 100).toFixed(0)}%)
+                  </span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

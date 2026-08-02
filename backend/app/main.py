@@ -8,7 +8,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -30,9 +30,11 @@ from app.models.schemas import (
 from app.graph.workflow import build_workflow, run_workflow_streaming
 from app.memory.vector_store import VectorStore, set_vector_store
 from app.memory.org_profile import load_org_profile, rebuild_org_profile, profile_path
+from app.rate_limit import DailyRateLimiter
 from langchain_core.messages import HumanMessage, AIMessage
 
 logger = logging.getLogger(__name__)
+chat_limiter = DailyRateLimiter(settings.rate_limit_per_ip_per_day)
 
 
 @asynccontextmanager
@@ -85,11 +87,19 @@ app.add_middleware(
 # Chat endpoint (SSE streaming)
 # ──────────────────────────────────────────────
 @app.post("/api/chat", response_class=EventSourceResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, http_request: Request):
     """
     Main chat endpoint. Accepts user message, runs the multi-agent workflow,
     and streams results back via Server-Sent Events.
     """
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    allowed, remaining, limit = chat_limiter.check(client_ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"今日试用次数已达上限（{limit} 次/IP）。请明天再试，或本地部署运行。",
+        )
+
     session_id = request.session_id or str(uuid.uuid4())
 
     message_history = None
@@ -107,14 +117,21 @@ async def chat(request: ChatRequest):
         yield {
             "event": "ping",
             "data": json.dumps(
-                {"session_id": session_id, "status": "connected"}, ensure_ascii=False
+                {
+                    "session_id": session_id,
+                    "status": "connected",
+                    "rate_limit_remaining": remaining,
+                    "demo_mode": bool(request.demo_mode or settings.demo_mode),
+                },
+                ensure_ascii=False,
             ),
         }
         logger.info(
-            "Chat request received: message='%s...', phase=%s, session=%s",
+            "Chat request received: message='%s...', phase=%s, session=%s demo=%s",
             request.message[:50],
             request.phase,
             session_id,
+            request.demo_mode,
         )
 
         try:
@@ -124,6 +141,8 @@ async def chat(request: ChatRequest):
                 session_id=session_id,
                 phase=request.phase,
                 message_history=message_history,
+                demo_mode=bool(request.demo_mode or settings.demo_mode),
+                skip_clarify=bool(request.skip_clarify),
             ):
                 raw = event["data"]
                 data = (
@@ -278,3 +297,26 @@ async def memory_stats():
     """Vector store statistics."""
     vs: VectorStore = app.state.vector_store
     return vs.get_stats()
+
+
+@app.get("/api/memory/chunks/{chunk_id:path}")
+async def get_memory_chunk(chunk_id: str):
+    """Get full chunk content for clickable citations."""
+    vs: VectorStore = app.state.vector_store
+    chunk = vs.get_chunk(chunk_id)
+    if not chunk:
+        raise HTTPException(status_code=404, detail="chunk not found")
+    return chunk
+
+
+@app.get("/api/health")
+async def health():
+    """Lightweight health check for hosting platforms."""
+    vs: VectorStore = app.state.vector_store
+    stats = vs.get_stats()
+    return {
+        "status": "ok",
+        "demo_mode": settings.demo_mode,
+        "document_count": stats.get("document_count", 0),
+        "rate_limit_per_ip_per_day": settings.rate_limit_per_ip_per_day,
+    }

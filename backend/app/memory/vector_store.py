@@ -289,6 +289,29 @@ class VectorStore:
             )
         return samples
 
+    def get_chunk(self, chunk_id: str) -> dict | None:
+        """Fetch a single chunk by id for citation preview."""
+        if not chunk_id:
+            return None
+        try:
+            raw = self.collection.get(ids=[chunk_id], include=["documents", "metadatas"])
+        except Exception as e:
+            logger.warning("get_chunk failed for %s: %s", chunk_id, e)
+            return None
+        if not raw or not raw.get("ids"):
+            return None
+        meta = (raw.get("metadatas") or [{}])[0] or {}
+        content = (raw.get("documents") or [""])[0] or ""
+        return {
+            "chunk_id": chunk_id,
+            "doc_id": meta.get("parent_id", ""),
+            "title": meta.get("title", "Untitled"),
+            "doc_type": meta.get("doc_type", "unknown"),
+            "section_title": meta.get("section_title", ""),
+            "content": content,
+            "metadata": meta,
+        }
+
     def get_stats(self) -> dict:
         """Get statistics about the vector store."""
         docs = self.list_documents()

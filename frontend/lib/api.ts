@@ -4,53 +4,60 @@
  * including SSE streaming for real-time agent updates.
  */
 
-import type { SSEEvent, MemoryResult, MemoryDoc, OrgProfile } from "./types";
+import type { SSEEvent, MemoryResult, MemoryDoc, OrgProfile, MemoryChunk } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 
-// ──────────────────────────────────────────────
-// Chat API (SSE Streaming)
-// ──────────────────────────────────────────────
+export interface ChatOptions {
+  demoMode?: boolean;
+  skipClarify?: boolean;
+  messageHistory?: { role: string; content: string }[];
+  signal?: AbortSignal;
+}
 
 /**
  * Send a chat message and receive streaming SSE events.
- *
- * @param message - User message to send
- * @param sessionId - Session ID (or null for new session)
- * @param phase - Forced phase or "auto"
- * @param onEvent - Callback for each SSE event
- * @param signal - AbortSignal for cancellation
  */
 export async function sendChatMessage(
   message: string,
   sessionId: string | null,
   phase: string = "auto",
   onEvent: (event: SSEEvent) => void,
-  signal?: AbortSignal,
-  messageHistory?: { role: string; content: string }[],
+  options: ChatOptions = {},
 ): Promise<string> {
   const payload: Record<string, unknown> = {
     message,
     session_id: sessionId,
     phase,
+    demo_mode: Boolean(options.demoMode),
+    skip_clarify: Boolean(options.skipClarify),
   };
-  // Include full conversation history for context
-  if (messageHistory && messageHistory.length > 0) {
-    payload.messages = messageHistory;
+  if (options.messageHistory && options.messageHistory.length > 0) {
+    payload.messages = options.messageHistory;
   }
 
   const response = await fetch(`${API_BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-    signal,
+    signal: options.signal,
   });
 
   if (!response.ok) {
-    throw new Error(`API error: ${response.status} ${response.statusText}`);
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(
+      response.status === 429
+        ? detail
+        : `API error: ${detail}`,
+    );
   }
 
-  // Parse SSE stream
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
   let currentSessionId = sessionId || "";
@@ -85,23 +92,14 @@ export async function sendChatMessage(
             // Skip malformed data lines
           }
         }
-        // Reset event type after processing data
         currentEventType = "agent_output";
       }
-      // Empty lines are SSE event separators — no action needed
     }
   }
 
   return currentSessionId;
 }
 
-// ──────────────────────────────────────────────
-// Memory API
-// ──────────────────────────────────────────────
-
-/**
- * Search organizational memory.
- */
 export async function searchMemory(
   query: string,
   topK: number = 5,
@@ -120,9 +118,6 @@ export async function searchMemory(
   return data.results;
 }
 
-/**
- * Store a document in organizational memory.
- */
 export async function storeMemory(
   content: string,
   docType: string = "other",
@@ -141,9 +136,6 @@ export async function storeMemory(
   return response.json();
 }
 
-/**
- * Upload a Markdown document into the knowledge base.
- */
 export async function uploadMemoryDoc(
   content: string,
   title: string,
@@ -168,9 +160,6 @@ export async function uploadMemoryDoc(
   return response.json();
 }
 
-/**
- * List knowledge base documents.
- */
 export async function listMemoryDocs(): Promise<{
   documents: MemoryDoc[];
   stats: Record<string, unknown>;
@@ -182,9 +171,6 @@ export async function listMemoryDocs(): Promise<{
   return response.json();
 }
 
-/**
- * Delete a knowledge base document.
- */
 export async function deleteMemoryDoc(docId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/memory/docs/${docId}`, {
     method: "DELETE",
@@ -194,9 +180,6 @@ export async function deleteMemoryDoc(docId: string): Promise<void> {
   }
 }
 
-/**
- * Get Org Profile.
- */
 export async function getOrgProfile(): Promise<{ profile: OrgProfile; path: string }> {
   const response = await fetch(`${API_BASE}/memory/profile`);
   if (!response.ok) {
@@ -205,9 +188,6 @@ export async function getOrgProfile(): Promise<{ profile: OrgProfile; path: stri
   return response.json();
 }
 
-/**
- * Rebuild Org Profile from current knowledge base.
- */
 export async function rebuildOrgProfile(): Promise<{ profile: OrgProfile; path: string }> {
   const response = await fetch(`${API_BASE}/memory/profile/rebuild`, {
     method: "POST",
@@ -219,13 +199,17 @@ export async function rebuildOrgProfile(): Promise<{ profile: OrgProfile; path: 
   return response.json();
 }
 
-// ──────────────────────────────────────────────
-// Agent Status API
-// ──────────────────────────────────────────────
+/** Fetch full chunk text for a citation. */
+export async function getMemoryChunk(chunkId: string): Promise<MemoryChunk> {
+  const response = await fetch(
+    `${API_BASE}/memory/chunks/${encodeURIComponent(chunkId)}`,
+  );
+  if (!response.ok) {
+    throw new Error(`Chunk fetch error: ${response.status}`);
+  }
+  return response.json();
+}
 
-/**
- * Get agent execution status for a session.
- */
 export async function getAgentStatus(sessionId: string) {
   const response = await fetch(`${API_BASE}/agents/status?session_id=${sessionId}`);
 

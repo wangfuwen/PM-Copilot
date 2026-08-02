@@ -163,55 +163,13 @@ class OrgMemoryAgent:
 
 
 async def write_back_results(state: dict[str, Any], llm: BaseChatModel) -> list[str]:
-    """Persist decision / PRD / stress summary into org memory after a run."""
-    agent = OrgMemoryAgent(llm=llm, vector_store=get_vector_store())
-    stored_ids: list[str] = []
-    user_input = (state.get("user_input") or "")[:80]
+    """
+    Formerly auto-persisted decision/PRD/stress into org memory.
 
-    decision = state.get("decision_output")
-    if decision:
-        content = json.dumps(decision, ensure_ascii=False, indent=2)
-        doc_id = await agent.store_document(
-            content=content,
-            doc_type="decision",
-            metadata={
-                "title": f"决策-{decision.get('recommendation', 'N/A')}-{user_input}",
-                "source": "workflow_writeback",
-            },
-            summarize_if_long=False,
-        )
-        stored_ids.append(doc_id)
-
-    prd = state.get("prd_output")
-    if prd:
-        doc_id = await agent.store_document(
-            content=prd,
-            doc_type="prd",
-            metadata={
-                "title": f"PRD-{user_input or 'generated'}",
-                "source": "workflow_writeback",
-            },
-            summarize_if_long=True,
-        )
-        stored_ids.append(doc_id)
-
-    stress = state.get("stress_test_summary")
-    if stress:
-        challenges = state.get("stress_test_results") or []
-        content = json.dumps(
-            {"summary": stress, "challenges": challenges[:10]},
-            ensure_ascii=False,
-            indent=2,
-        )
-        doc_id = await agent.store_document(
-            content=content,
-            doc_type="stress_test",
-            metadata={
-                "title": f"压力测试-{user_input or 'run'}",
-                "source": "workflow_writeback",
-            },
-            summarize_if_long=False,
-        )
-        stored_ids.append(doc_id)
-
-    return stored_ids
+    Disabled: knowledge base is upload-only so chat prompts like
+    「请帮我生成 PRD」 are not indexed as documents.
+    """
+    logger.info(
+        "write_back_results: skipped (upload-only memory; not writing workflow outputs)"
+    )
+    return []

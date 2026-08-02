@@ -26,6 +26,7 @@ export function AgentTimeline({ agents }: AgentTimelineProps) {
         const isLast = index === agents.length - 1;
         const isActive = agent.status === "running";
         const isComplete = agent.status === "completed";
+        const isSkipped = agent.status === "skipped";
 
         return (
           <div key={agent.name} className="flex items-start gap-3">
@@ -36,7 +37,8 @@ export function AgentTimeline({ agents }: AgentTimelineProps) {
                   "h-3 w-3 rounded-full border-2 shrink-0",
                   isActive && "border-agent-running bg-agent-running/30",
                   isComplete && "border-agent-completed bg-agent-completed",
-                  !isActive && !isComplete && "border-muted bg-muted/30",
+                  isSkipped && "border-muted bg-transparent",
+                  !isActive && !isComplete && !isSkipped && "border-muted bg-muted/30",
                 )}
               />
               {!isLast && (
@@ -54,9 +56,12 @@ export function AgentTimeline({ agents }: AgentTimelineProps) {
               <div className="flex items-center gap-1.5">
                 <span className="text-xs">{agent.icon}</span>
                 <span className="text-xs font-medium text-foreground">{agent.displayName}</span>
+                {isSkipped && (
+                  <span className="text-[10px] text-muted-foreground">本轮未执行</span>
+                )}
               </div>
-              {agent.summary && (
-                <p className="text-xs text-muted-foreground mt-0.5 truncate max-w-[200px]">
+              {agent.summary && isComplete && (
+                <p className="text-[10px] text-muted-foreground mt-0.5 truncate max-w-[200px]">
                   {agent.summary}
                 </p>
               )}

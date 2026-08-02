@@ -14,11 +14,19 @@ class ChatRequest(BaseModel):
     """User chat request."""
     message: str = Field(..., description="User message / requirement description")
     session_id: Optional[str] = Field(None, description="Conversation session ID, auto-generated if not provided")
-    phase: Optional[Literal["decision", "prd_generation", "stress_test", "auto"]] = Field(
+    phase: Optional[Literal["decision", "prd_generation", "stress_test", "auto", "full_pipeline"]] = Field(
         "auto", description="Force a specific phase, or 'auto' to let orchestrator decide"
     )
     messages: Optional[list[dict]] = Field(
         None, description="Full conversation history for context (list of {role, content})"
+    )
+    demo_mode: bool = Field(
+        default=False,
+        description="Cheaper path: prefer mini models and optionally skip stress test",
+    )
+    skip_clarify: bool = Field(
+        default=False,
+        description="Skip clarifying questions and decide immediately",
     )
 
 

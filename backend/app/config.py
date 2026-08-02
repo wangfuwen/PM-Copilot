@@ -57,6 +57,21 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = Field(default="INFO")
 
+    # Demo / trial protection
+    demo_mode: bool = Field(
+        default=False,
+        description="Use cheaper models and skip stress test by default",
+    )
+    demo_skip_stress: bool = Field(default=True, description="Skip stress test in demo mode")
+    rate_limit_per_ip_per_day: int = Field(
+        default=20,
+        description="Max /api/chat calls per IP per day (0 = disabled)",
+    )
+    enable_decision_clarify: bool = Field(
+        default=True,
+        description="Ask 3-5 clarifying questions before decision report",
+    )
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
