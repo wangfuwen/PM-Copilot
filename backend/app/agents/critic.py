@@ -15,6 +15,8 @@ from typing import Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.language_models import BaseChatModel
 
+from app.telemetry import ainvoke_with_retry
+
 logger = logging.getLogger(__name__)
 
 CRITIC_SYSTEM_PROMPT = """你是严格的产品质量审查专家。请审查产品经理产出物，确保达到专业标准。
@@ -50,9 +52,13 @@ class CriticAgent:
         ]
         try:
             json_llm = self.llm.bind(response_format={"type": "json_object"})
-            response = await json_llm.ainvoke(messages)
+            response = await ainvoke_with_retry(
+                json_llm, messages, max_retries=2, agent="critic"
+            )
         except Exception:
-            response = await self.llm.ainvoke(messages)
+            response = await ainvoke_with_retry(
+                self.llm, messages, max_retries=2, agent="critic"
+            )
 
         raw = self._extract_json(response.content or "")
         try:

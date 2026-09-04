@@ -48,7 +48,7 @@ export function HistorySidebar({
 
   if (collapsed) {
     return (
-      <aside className="flex w-12 flex-col items-center border-r border-border bg-[#0c0f14] py-3">
+      <aside className="flex h-full w-12 shrink-0 flex-col items-center border-r border-border bg-[#0c0f14] py-3">
         <button
           type="button"
           onClick={onToggleCollapsed}
@@ -70,7 +70,7 @@ export function HistorySidebar({
   }
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-[#0c0f14]">
+    <aside className="flex h-full min-h-0 w-60 shrink-0 flex-col border-r border-border bg-[#0c0f14]">
       <div className="flex items-center justify-between gap-2 px-3 py-3">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-foreground">

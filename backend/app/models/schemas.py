@@ -10,6 +10,22 @@ from pydantic import BaseModel, Field
 # ──────────────────────────────────────────────
 # Chat
 # ──────────────────────────────────────────────
+class WorkflowContext(BaseModel):
+    """Structured artifacts carried between workflow phases."""
+
+    original_requirement: Optional[str] = Field(
+        None, description="Original product requirement that started the workflow"
+    )
+    decision_output: Optional[dict] = Field(
+        None, description="Latest structured decision result"
+    )
+    prd_output: Optional[str] = Field(None, description="Latest PRD artifact")
+    accepted_issues: list[str] = Field(
+        default_factory=list,
+        description="Review issues explicitly accepted by the user for the next revision",
+    )
+
+
 class ChatRequest(BaseModel):
     """User chat request."""
     message: str = Field(..., description="User message / requirement description")
@@ -19,6 +35,9 @@ class ChatRequest(BaseModel):
     )
     messages: Optional[list[dict]] = Field(
         None, description="Full conversation history for context (list of {role, content})"
+    )
+    workflow_context: Optional[WorkflowContext] = Field(
+        None, description="Structured artifacts restored from the current project/session"
     )
     demo_mode: bool = Field(
         default=False,
@@ -169,3 +188,7 @@ class StressTestOutput(BaseModel):
     challenges: list[StressTestChallenge]
     overall_score: float = Field(default=0.0, ge=0.0, le=100.0, description="Overall PRD health score")
     summary: str = Field(default="", description="Executive summary of findings")
+    failed_roles: list[str] = Field(
+        default_factory=list,
+        description="Roles that failed without blocking the remaining review",
+    )

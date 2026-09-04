@@ -20,6 +20,7 @@ from langchain_core.language_models import BaseChatModel
 from app.models.schemas import DecisionOutput
 from app.prompts.decision import DECISION_SYSTEM_PROMPT, DECISION_USER_PROMPT
 from app.config import settings
+from app.telemetry import ainvoke_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -425,9 +426,13 @@ class DecisionAgent:
     async def _invoke_text(self, messages: list) -> str:
         try:
             json_llm = self.llm.bind(response_format={"type": "json_object"})
-            response = await json_llm.ainvoke(messages)
+            response = await ainvoke_with_retry(
+                json_llm, messages, max_retries=2, agent="decision"
+            )
         except Exception:
-            response = await self.llm.ainvoke(messages)
+            response = await ainvoke_with_retry(
+                self.llm, messages, max_retries=2, agent="decision"
+            )
         return response.content or ""
 
     @staticmethod

@@ -81,8 +81,12 @@ class OrchestratorAgent:
         from langchain_core.messages import HumanMessage
         messages.append(HumanMessage(content=user_message))
 
-        response = await self.llm.ainvoke(messages)
-        intent = response.content.strip().lower()
+        from app.telemetry import ainvoke_with_retry
+
+        response = await ainvoke_with_retry(
+            self.llm, messages, max_retries=2, agent="orchestrator"
+        )
+        intent = (response.content or "").strip().lower()
 
         # Normalize intent
         valid_intents = {"decision", "prd_generation", "stress_test", "full_pipeline"}

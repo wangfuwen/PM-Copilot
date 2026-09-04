@@ -5,13 +5,14 @@ Generates structured, professional PRDs based on decision analysis output
 and organizational memory (historical templates and patterns).
 """
 
+import json
 import logging
 from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.language_models import BaseChatModel
 
-from app.prompts.prd import PRD_SYSTEM_PROMPT, PRD_USER_PROMPT
+from app.prompts.prd import PRD_REVISION_PROMPT, PRD_SYSTEM_PROMPT, PRD_USER_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,9 @@ class PRDWriterAgent:
         decision_output: dict | None = None,
         org_memory_context: str = "",
         org_profile_text: str = "",
+        current_prd: str = "",
+        revision_instruction: str = "",
+        accepted_issues: list[str] | None = None,
     ) -> str:
         """
         Generate a PRD based on requirements and decision analysis.
@@ -77,24 +81,40 @@ class PRDWriterAgent:
         # Format decision output for the prompt
         decision_str = ""
         if decision_output:
-            import json
             decision_str = json.dumps(decision_output, ensure_ascii=False, indent=2)
         else:
             decision_str = "（未进行前置决策分析，请直接基于需求描述生成 PRD）"
 
-        user_prompt = (
-            PRD_USER_PROMPT
-            .replace("{user_requirement}", user_requirement)
-            .replace("{decision_output}", decision_str)
-        )
+        if current_prd:
+            issues_text = "\n".join(
+                f"{index}. {issue}" for index, issue in enumerate(accepted_issues or [], 1)
+            ) or "（无；仅按用户本轮指令修改）"
+            user_prompt = (
+                PRD_REVISION_PROMPT
+                .replace("{user_requirement}", user_requirement)
+                .replace("{decision_output}", decision_str)
+                .replace("{current_prd}", current_prd)
+                .replace("{revision_instruction}", revision_instruction or "按已接受问题修订")
+                .replace("{accepted_issues}", issues_text)
+            )
+        else:
+            user_prompt = (
+                PRD_USER_PROMPT
+                .replace("{user_requirement}", user_requirement)
+                .replace("{decision_output}", decision_str)
+            )
 
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
         ]
 
-        response = await self.llm.ainvoke(messages)
-        prd_content = response.content
+        from app.telemetry import ainvoke_with_retry
+
+        response = await ainvoke_with_retry(
+            self.llm, messages, max_retries=2, agent="prd_writer"
+        )
+        prd_content = response.content or ""
 
         logger.info(f"PRDWriterAgent: Generated PRD ({len(prd_content)} chars)")
         return prd_content
@@ -109,17 +129,32 @@ class PRDWriterAgent:
         Returns:
             Updated state with prd_output populated.
         """
-        user_input = state.get("user_input", "")
+        user_input = state.get("original_requirement") or state.get("user_input", "")
+        revision_instruction = state.get("user_input", "") or ""
         decision = state.get("decision_output")
         org_context = state.get("org_memory_context", "")
         org_profile_text = state.get("org_profile_text", "") or ""
+        current_prd = state.get("prd_output", "") or ""
+        accepted_issues = state.get("accepted_issues") or []
 
-        logger.info("PRDWriterAgent: Generating PRD...")
-        prd = await self.generate(user_input, decision, org_context, org_profile_text)
+        logger.info(
+            "PRDWriterAgent: %s PRD...",
+            "Revising" if current_prd else "Generating",
+        )
+        prd = await self.generate(
+            user_input,
+            decision,
+            org_context,
+            org_profile_text,
+            current_prd=current_prd,
+            revision_instruction=revision_instruction,
+            accepted_issues=accepted_issues,
+        )
 
         return {
             **state,
             "prd_output": prd,
+            "prd_revision": bool(current_prd),
             "current_phase": "stress_test",
             "next_agent": "stress_test",
         }

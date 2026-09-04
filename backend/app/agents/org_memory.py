@@ -100,8 +100,12 @@ class OrgMemoryAgent:
                 HumanMessage(content="请按要求总结以上文档。"),
             ]
             try:
-                response = await self.llm.ainvoke(messages)
-                to_store = response.content
+                from app.telemetry import ainvoke_with_retry
+
+                response = await ainvoke_with_retry(
+                    self.llm, messages, max_retries=1, agent="org_memory"
+                )
+                to_store = response.content or content[:3000]
                 meta["summarized"] = True
             except Exception as e:
                 logger.warning("Summarize before store failed, storing truncated raw: %s", e)

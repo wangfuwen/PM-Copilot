@@ -5,6 +5,7 @@ import { ChatWindow } from "@/components/chat/ChatWindow";
 import { InputBar } from "@/components/chat/InputBar";
 import { AgentStatus } from "@/components/agents/AgentStatus";
 import { AgentTimeline } from "@/components/agents/AgentTimeline";
+import { EvaluationPanel } from "@/components/agents/EvaluationPanel";
 import { MemoryPanel } from "@/components/memory/MemoryPanel";
 import { HistorySidebar } from "@/components/sidebar/HistorySidebar";
 import { SKIP_CLARIFY_TOKEN } from "@/components/chat/ClarifyOptions";
@@ -32,7 +33,14 @@ import type {
   MemoryCitation,
   ClarifyStep,
   CriticFeedback,
+  EvaluationResult,
+  AgentMetrics,
   AgentName,
+  DecisionOutput,
+  WorkflowContext,
+  IssueStatus,
+  StressTestChallenge,
+  StressTestSummary,
 } from "@/lib/types";
 
 const QUICK_ACTIONS = [
@@ -41,6 +49,17 @@ const QUICK_ACTIONS = [
   { id: "full", label: "完整流程", description: "决策 → PRD → 审查 → 压力测试", phase: "full_pipeline" as const, icon: "🚀" },
   { id: "stress", label: "压力测试", description: "5 角色红队挑战", phase: "stress_test" as const, icon: "⚡" },
 ];
+
+const CONTROL_INPUT_RE =
+  /^(请帮我(分析需求|生成 PRD|完整流程|压力测试)|请基于刚才|请基于当前|跳过，直接决策|__SKIP_CLARIFY__)/;
+
+const PHASE_LABELS: Record<string, string> = {
+  auto: "智能判断",
+  decision: "分析需求",
+  prd_generation: "生成 PRD",
+  full_pipeline: "完整流程",
+  stress_test: "压力测试",
+};
 
 function applyConversationToState(
   store: HistoryStore,
@@ -88,9 +107,11 @@ export default function Home() {
   const [memoryEmpty, setMemoryEmpty] = useState(false);
   const [awaitingClarification, setAwaitingClarification] = useState(false);
   const [clarifyResumePhase, setClarifyResumePhase] = useState<string>("decision");
-  const [demoMode, setDemoMode] = useState(true);
+  const [demoMode, setDemoMode] = useState(false);
+  const [selectedPhase, setSelectedPhase] = useState<string>("auto");
   const [rateLimitRemaining, setRateLimitRemaining] = useState<number | null>(null);
   const [decisionDone, setDecisionDone] = useState(false);
+  const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null);
   const sendMessageRef = useRef<
     ((content: string, forcedPhase?: string) => Promise<void>) | null
   >(null);
@@ -168,6 +189,7 @@ export default function Home() {
       historyStore,
       historyStore.activeProjectId,
     );
+    setEvaluation(null);
     updateStore(next, true);
   }, [historyStore, updateStore]);
 
@@ -197,6 +219,7 @@ export default function Home() {
         clarifyResumePhase,
       });
       const next = selectConversation(flushed, projectId, conversationId);
+      setEvaluation(null);
       updateStore(next, true);
     },
     [
@@ -244,6 +267,7 @@ export default function Home() {
     setMessages((prev) =>
       prev.filter((m) => m.metadata?.kind !== "continue_prompt"),
     );
+    setSelectedPhase("auto");
     void sendMessageRef.current?.(
       prompts[nextPhase] || "请继续下一步",
       nextPhase,
@@ -296,6 +320,7 @@ export default function Home() {
         );
 
       setAgents(buildInitialAgents(phaseToUse, agents, hadDecision));
+      setEvaluation(null);
       // Keep prior citations visible in side panel unless this turn replaces them
       setMemoryEmpty(false);
 
@@ -313,6 +338,7 @@ export default function Home() {
       let sawClarification = false;
       let sawDecision = false;
       let sawPrd = false;
+      let decisionRecommendation: string | undefined;
 
       try {
         const { sendChatMessage } = await import("@/lib/api");
@@ -346,6 +372,8 @@ export default function Home() {
         ) {
           messageHistory[messageHistory.length - 1].content = apiContent;
         }
+
+        const workflowContext = buildWorkflowContext(nextMessages);
 
         timeoutId = setTimeout(() => {
           setIsLoading(false);
@@ -383,7 +411,9 @@ export default function Home() {
                       ? {
                           ...a,
                           status: "running" as const,
-                          startedAt: new Date().toISOString(),
+                          startedAt:
+                            (event.data.started_at as string) ||
+                            new Date().toISOString(),
                         }
                       : a,
                   ),
@@ -457,6 +487,7 @@ export default function Home() {
                         [
                           "prd_writer",
                           "critic",
+                          "evaluator",
                           "stress_test",
                           "memory_writeback",
                         ].includes(a.name)
@@ -466,8 +497,26 @@ export default function Home() {
                     );
                   }
 
+                  if (output.evaluation) {
+                    setEvaluation(output.evaluation);
+                    setMessages((prev) => [
+                      ...prev,
+                      {
+                        id: `eval-${Date.now()}`,
+                        role: "assistant",
+                        content:
+                          output.evaluation!.report ||
+                          formatEvaluationOutput(output.evaluation!),
+                        agentName: "evaluator",
+                        timestamp: new Date(),
+                        metadata: { evaluation: output.evaluation },
+                      },
+                    ]);
+                  }
+
                   if (output.decision) {
                     sawDecision = true;
+                    decisionRecommendation = output.decision.recommendation;
                     setDecisionDone(true);
                     setAwaitingClarification(false);
                     setMessages((prev) => [
@@ -478,22 +527,56 @@ export default function Home() {
                         content: formatDecisionOutput(output.decision),
                         agentName: "decision",
                         timestamp: new Date(),
+                        metadata: { decision: output.decision },
                       },
                     ]);
                   }
 
                   if (output.prd) {
                     sawPrd = true;
-                    setMessages((prev) => [
-                      ...prev,
-                      {
+                    const isRevision = Boolean(output.prd_revision);
+                    setMessages((prev) => {
+                      const updatedMessages = isRevision
+                        ? prev.map((message) => {
+                            const issues = message.metadata?.stress_test as
+                              | StressTestChallenge[]
+                              | undefined;
+                            if (!issues?.some((issue) => issue.status === "accepted")) {
+                              return message;
+                            }
+                            return {
+                              ...message,
+                              metadata: {
+                                ...message.metadata,
+                                stress_test: issues.map((issue) =>
+                                  issue.status === "accepted"
+                                    ? { ...issue, status: "applied" as const }
+                                    : issue,
+                                ),
+                              },
+                            };
+                          })
+                        : prev;
+                      const version =
+                        updatedMessages.filter(
+                          (message) => message.agentName === "prd_writer",
+                        ).length + 1;
+                      return [
+                        ...updatedMessages,
+                        {
                         id: `prd-${Date.now()}`,
                         role: "assistant",
                         content: output.prd!,
                         agentName: "prd_writer",
                         timestamp: new Date(),
-                      },
-                    ]);
+                          metadata: {
+                            prd: output.prd,
+                            version,
+                            revised: isRevision,
+                          },
+                        },
+                      ];
+                    });
                   }
 
                   if (output.critic) {
@@ -513,17 +596,31 @@ export default function Home() {
                   const stressTestSummary =
                     output.stressTestSummary ?? output.stress_test_summary;
                   if (stressTest) {
+                    const issueBatchId = Date.now();
+                    const normalizedIssues = (stressTest as StressTestChallenge[]).map(
+                      (issue, index) => ({
+                        ...issue,
+                        id: issue.id || `issue-${issueBatchId}-${index}`,
+                        status: issue.status || ("open" as const),
+                      }),
+                    );
                     setMessages((prev) => [
                       ...prev,
                       {
-                        id: `stress-${Date.now()}`,
+                        id: `stress-${issueBatchId}`,
                         role: "assistant",
                         content: formatStressTestOutput(
-                          stressTest as any[],
+                          normalizedIssues,
                           stressTestSummary,
                         ),
                         agentName: "stress_test",
                         timestamp: new Date(),
+                        metadata: {
+                          kind: "stress_test",
+                          stress_test: normalizedIssues,
+                          stress_test_summary:
+                            stressTestSummary as StressTestSummary | undefined,
+                        },
                       },
                     ]);
                   }
@@ -532,22 +629,39 @@ export default function Home() {
 
               case "agent_complete": {
                 const agentName = event.data.agent as AgentName | undefined;
+                const metrics = event.data.metrics as AgentMetrics | undefined;
+                const failed = Boolean(metrics?.error);
                 setAgents((prev) =>
                   prev.map((a) => {
                     if (a.name !== agentName) return a;
-                    // Upload-only: writeback node is a no-op
                     if (agentName === "memory_writeback") {
                       return {
                         ...a,
                         status: "skipped" as const,
                         summary: "仅上传入库，不自动写入",
-                        completedAt: new Date().toISOString(),
+                        completedAt:
+                          (event.data.completed_at as string) ||
+                          new Date().toISOString(),
+                        metrics,
+                        durationMs: metrics?.duration_ms,
+                        retryCount: metrics?.retry_count,
+                        tokens: metrics?.tokens,
                       };
                     }
                     return {
                       ...a,
-                      status: "completed" as const,
-                      completedAt: new Date().toISOString(),
+                      status: failed ? ("failed" as const) : ("completed" as const),
+                      completedAt:
+                        (event.data.completed_at as string) ||
+                        new Date().toISOString(),
+                      startedAt: a.startedAt || (event.data.started_at as string),
+                      metrics,
+                      durationMs: metrics?.duration_ms,
+                      retryCount: metrics?.retry_count ?? 0,
+                      tokens: metrics?.tokens,
+                      summary: metrics?.error
+                        ? String(metrics.error).slice(0, 80)
+                        : a.summary,
                     };
                   }),
                 );
@@ -583,7 +697,11 @@ export default function Home() {
                         role: "assistant",
                         content: "下一步",
                         timestamp: new Date(),
-                        metadata: { kind: "continue_prompt" },
+                        metadata: {
+                          kind: "continue_prompt",
+                          recommendation: decisionRecommendation,
+                          has_prd: sawPrd || Boolean(workflowContext.prd_output),
+                        },
                       },
                     ];
                   });
@@ -614,6 +732,7 @@ export default function Home() {
             demoMode,
             skipClarify: false,
             messageHistory,
+            workflowContext,
           },
         );
         if (timeoutId !== undefined) clearTimeout(timeoutId);
@@ -648,6 +767,74 @@ export default function Home() {
     sendMessageRef.current = handleSendMessage;
   }, [handleSendMessage]);
 
+  const latestDecision = [...messages]
+    .reverse()
+    .map((m) => m.metadata?.decision as DecisionOutput | undefined)
+    .find(Boolean);
+  const hasPrd = messages.some(
+    (m) => m.agentName === "prd_writer" && Boolean(m.content.trim()),
+  );
+
+  const handleIssueStatusChange = useCallback(
+    (messageId: string, issueIndex: number, status: IssueStatus) => {
+      setMessages((prev) =>
+        prev.map((message) => {
+          if (message.id !== messageId) return message;
+          const issues = message.metadata?.stress_test as
+            | StressTestChallenge[]
+            | undefined;
+          if (!issues?.[issueIndex] || issues[issueIndex].status === "applied") {
+            return message;
+          }
+          const nextIssues = [...issues];
+          nextIssues[issueIndex] = { ...nextIssues[issueIndex], status };
+          return {
+            ...message,
+            metadata: { ...message.metadata, stress_test: nextIssues },
+          };
+        }),
+      );
+    },
+    [],
+  );
+
+  const handleApplyAcceptedIssues = useCallback(
+    (messageId: string) => {
+      const source = messages.find((message) => message.id === messageId);
+      const issues = source?.metadata?.stress_test as
+        | StressTestChallenge[]
+        | undefined;
+      const acceptedCount =
+        issues?.filter((issue) => issue.status === "accepted").length || 0;
+      if (acceptedCount === 0) return;
+      void handleSendMessage(
+        `请根据我已接受的 ${acceptedCount} 条评审建议修订当前 PRD，并保留未受影响的内容。`,
+        "prd_generation",
+      );
+    },
+    [handleSendMessage, messages],
+  );
+
+  const handleQuickAction = useCallback(
+    (action: (typeof QUICK_ACTIONS)[number]) => {
+      if (
+        action.phase === "prd_generation" &&
+        decisionDone &&
+        !hasPrd &&
+        latestDecision?.recommendation !== "KILL"
+      ) {
+        handleContinue("prd_generation");
+        return;
+      }
+      if (action.phase === "stress_test" && hasPrd) {
+        handleContinue("stress_test");
+        return;
+      }
+      setSelectedPhase(action.phase);
+    },
+    [decisionDone, handleContinue, hasPrd, latestDecision?.recommendation],
+  );
+
   const activeProjectName =
     historyStore?.projects.find((p) => p.id === historyStore.activeProjectId)
       ?.name || "默认项目";
@@ -656,7 +843,7 @@ export default function Home() {
     : "新对话";
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex h-screen max-h-screen overflow-hidden">
       {historyStore && (
         <HistorySidebar
           store={historyStore}
@@ -671,8 +858,8 @@ export default function Home() {
         />
       )}
 
-      <div className="flex min-w-0 flex-1 flex-col border-r border-border">
-        <header className="flex items-center justify-between border-b border-border px-6 py-3">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col border-r border-border">
+        <header className="flex shrink-0 items-center justify-between border-b border-border px-6 py-3">
           <div className="min-w-0">
             <div className="flex items-baseline gap-2">
               <h1 className="text-base font-semibold text-foreground">
@@ -738,19 +925,23 @@ export default function Home() {
           isLoading={isLoading}
           onClarifySelect={handleSendMessage}
           onContinue={handleContinue}
+          onIssueStatusChange={handleIssueStatusChange}
+          onApplyAcceptedIssues={handleApplyAcceptedIssues}
         />
 
-        <div className="border-t border-border p-4">
+        <div className="shrink-0 border-t border-border p-4">
           {!awaitingClarification && (
             <div className="mb-3 flex flex-wrap gap-2">
               {QUICK_ACTIONS.map((action) => (
                 <button
                   key={action.id}
-                  onClick={() =>
-                    handleSendMessage(`请帮我${action.label}`, action.phase)
-                  }
+                  onClick={() => handleQuickAction(action)}
                   disabled={isLoading}
-                  className="flex items-center gap-1.5 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50"
+                  className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:opacity-50 ${
+                    selectedPhase === action.phase
+                      ? "border-primary bg-primary/15 text-foreground"
+                      : "border-border bg-secondary text-secondary-foreground hover:bg-accent"
+                  }`}
                 >
                   <span>{action.icon}</span>
                   <span>{action.label}</span>
@@ -759,34 +950,50 @@ export default function Home() {
             </div>
           )}
           <InputBar
-            onSend={handleSendMessage}
+            onSend={(content) => {
+              const forcedPhase =
+                awaitingClarification || selectedPhase === "auto"
+                  ? undefined
+                  : selectedPhase;
+              setSelectedPhase("auto");
+              void handleSendMessage(content, forcedPhase);
+            }}
             disabled={isLoading}
             placeholder={
               awaitingClarification
                 ? "也可以自己补充一句…"
-                : "描述你的产品需求..."
+                : selectedPhase === "stress_test" && !hasPrd
+                  ? "粘贴需要评审的完整 PRD..."
+                  : selectedPhase === "prd_generation"
+                    ? hasPrd
+                      ? "描述需要修改的内容，例如：收紧 P0 范围、补充验收标准..."
+                      : "描述需要生成 PRD 的真实需求..."
+                    : selectedPhase === "decision" || selectedPhase === "full_pipeline"
+                      ? `已选择${PHASE_LABELS[selectedPhase]}，请描述产品想法...`
+                      : "描述你的产品需求..."
             }
           />
         </div>
       </div>
 
-      <div className="flex w-96 flex-col bg-card">
-        <div className="border-b border-border px-4 py-3">
+      <div className="flex min-h-0 w-96 shrink-0 flex-col overflow-hidden bg-card">
+        <div className="shrink-0 border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-foreground">Agent 协作面板</h2>
           <p className="text-xs text-muted-foreground">实时查看各 Agent 执行状态</p>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
           <AgentStatus agents={agents} />
-        </div>
-
-        <div className="border-t border-border p-4">
-          <h3 className="mb-2 text-xs font-semibold text-muted-foreground">执行时间线</h3>
-          <AgentTimeline agents={agents} />
-        </div>
-
-        <div className="border-t border-border p-4">
-          <MemoryPanel citations={citations} memoryEmpty={memoryEmpty} />
+          <div className="mt-4 border-t border-border pt-4">
+            <h3 className="mb-2 text-xs font-semibold text-muted-foreground">执行时间线</h3>
+            <AgentTimeline agents={agents} />
+          </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <EvaluationPanel evaluation={evaluation} />
+          </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <MemoryPanel citations={citations} memoryEmpty={memoryEmpty} />
+          </div>
         </div>
       </div>
     </div>
@@ -805,6 +1012,7 @@ function buildInitialAgents(
     { name: "decision", displayName: "决策顾问", icon: "🎯", status: "pending" },
     { name: "prd_writer", displayName: "PRD 撰写", icon: "📝", status: "pending" },
     { name: "critic", displayName: "质量审查", icon: "🔍", status: "pending" },
+    { name: "evaluator", displayName: "Evaluation", icon: "📊", status: "pending" },
     { name: "stress_test", displayName: "压力测试", icon: "⚡", status: "pending" },
     {
       name: "memory_writeback",
@@ -840,6 +1048,45 @@ function buildInitialAgents(
   }
 
   return agents;
+}
+
+function buildWorkflowContext(messages: Message[]): WorkflowContext {
+  const originalRequirement = messages.find(
+    (m) =>
+      m.role === "user" &&
+      Boolean(m.content.trim()) &&
+      !CONTROL_INPUT_RE.test(m.content.trim()),
+  )?.content;
+
+  const decision = [...messages]
+    .reverse()
+    .map((m) => m.metadata?.decision as DecisionOutput | undefined)
+    .find((value): value is DecisionOutput => Boolean(value));
+
+  const prd = [...messages]
+    .reverse()
+    .find((m) => m.agentName === "prd_writer" && Boolean(m.content.trim()))
+    ?.content;
+
+  const acceptedIssues = messages
+    .flatMap(
+      (message) =>
+        (message.metadata?.stress_test as StressTestChallenge[] | undefined) || [],
+    )
+    .filter((issue) => issue.status === "accepted")
+    .map((issue) => {
+      const suggestions = issue.suggestions?.filter(Boolean).join("；");
+      return `${issue.role}：${issue.challenge}${
+        suggestions ? `；建议：${suggestions}` : ""
+      }`;
+    });
+
+  return {
+    original_requirement: originalRequirement,
+    decision_output: decision,
+    prd_output: prd,
+    accepted_issues: [...new Set(acceptedIssues)],
+  };
 }
 
 /** Build history blob matching backend format_clarify_step for next-turn parsing. */
@@ -905,6 +1152,26 @@ function formatDecisionOutput(decision: any): string {
   return text;
 }
 
+function formatEvaluationOutput(evaluation: EvaluationResult): string {
+  const labels: Record<string, string> = {
+    completeness: "完整性",
+    consistency: "一致性",
+    requirement_fit: "需求契合",
+    clarity: "清晰度",
+    actionability: "可落地性",
+  };
+  const target = evaluation.target === "prd" ? "PRD" : "决策";
+  let text = `## Evaluation · ${target}\n\n`;
+  text += `**综合分**: ${evaluation.overall ?? "—"}/10 · **结论**: ${evaluation.verdict || "—"}\n\n`;
+  if (evaluation.summary) text += `${evaluation.summary}\n\n`;
+  text += "**分项得分**:\n";
+  Object.entries(labels).forEach(([k, label]) => {
+    const v = evaluation.scores?.[k as keyof typeof evaluation.scores];
+    text += `- ${label}: ${v ?? "—"}/10\n`;
+  });
+  return text;
+}
+
 function formatCriticOutput(critic: CriticFeedback): string {
   if (critic.review) return critic.review;
   let text = `## 质量审查\n\n**评分**: ${critic.score ?? "N/A"}/10\n\n`;
@@ -929,6 +1196,9 @@ function formatCriticOutput(critic: CriticFeedback): string {
 function formatStressTestOutput(challenges: any[], summary?: any): string {
   let text = "## ⚡ 压力测试报告\n\n";
   if (summary) {
+    if (summary.summary === "missing_prd" || summary.missing_prd) {
+      return "## ⚡ 压力测试\n\n尚未找到可评审的 PRD。请先生成 PRD，或选择「压力测试」后粘贴完整 PRD。\n";
+    }
     if (summary.summary === "skipped_in_demo_mode") {
       return "## ⚡ 压力测试\n\n演示模式下已跳过压力测试以控制成本。关闭「演示模式」后可完整运行。\n";
     }

@@ -2,13 +2,19 @@
 
 import { useRef, useEffect } from "react";
 import { MessageBubble } from "./MessageBubble";
-import type { Message } from "@/lib/types";
+import type { Message, IssueStatus } from "@/lib/types";
 
 interface ChatWindowProps {
   messages: Message[];
   isLoading: boolean;
   onClarifySelect?: (value: string) => void;
   onContinue?: (phase: string) => void;
+  onIssueStatusChange?: (
+    messageId: string,
+    issueIndex: number,
+    status: IssueStatus,
+  ) => void;
+  onApplyAcceptedIssues?: (messageId: string) => void;
 }
 
 export function ChatWindow({
@@ -16,15 +22,23 @@ export function ChatWindow({
   isLoading,
   onClarifySelect,
   onContinue,
+  onIssueStatusChange,
+  onApplyAcceptedIssues,
 }: ChatWindowProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Scroll only the chat container — never the page (scrollIntoView can shift the whole UI).
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
   }, [messages, isLoading]);
 
   return (
-    <div className="flex-1 overflow-y-auto px-6 py-4">
+    <div
+      ref={scrollRef}
+      className="min-h-0 flex-1 overflow-y-auto px-6 py-4"
+    >
       <div className="mx-auto max-w-3xl space-y-4">
         {messages.map((msg) => (
           <MessageBubble
@@ -32,6 +46,8 @@ export function ChatWindow({
             message={msg}
             onClarifySelect={onClarifySelect}
             onContinue={onContinue}
+            onIssueStatusChange={onIssueStatusChange}
+            onApplyAcceptedIssues={onApplyAcceptedIssues}
             clarifyDisabled={isLoading}
           />
         ))}
@@ -55,8 +71,6 @@ export function ChatWindow({
             <span className="text-xs text-muted-foreground">Agent 正在思考...</span>
           </div>
         )}
-
-        <div ref={bottomRef} />
       </div>
     </div>
   );

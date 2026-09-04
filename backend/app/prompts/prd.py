@@ -72,3 +72,26 @@ PRD_USER_PROMPT = """请基于以下信息生成一份完整的 PRD：
 
 请生成一份专业、可执行的 PRD 文档。
 """
+
+PRD_REVISION_PROMPT = """请修订下面这份现有 PRD，而不是重新发散生成一份无关文档。
+
+## 原始需求
+{user_requirement}
+
+## 决策分析结果
+{decision_output}
+
+## 当前 PRD
+{current_prd}
+
+## 用户本轮修改指令
+{revision_instruction}
+
+## 用户已接受的评审问题
+{accepted_issues}
+
+要求：
+1. 完整保留未被修改指令影响的章节与事实。
+2. 逐条解决已接受的问题，并把修改落实到对应章节。
+3. 不要输出修改说明、对照表或前言，只输出修订后的完整 PRD。
+"""

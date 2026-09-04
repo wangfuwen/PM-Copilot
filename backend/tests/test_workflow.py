@@ -5,6 +5,7 @@ Tests the workflow structure, state management, and agent initialization.
 Run with: pytest tests/ -v
 """
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +23,8 @@ from app.graph.workflow import (
     route_after_orchestrator,
     route_after_org_memory,
     route_after_decision,
-    route_after_critic,
+    route_after_evaluator,
+    build_node_output,
 )
 
 
@@ -68,12 +70,20 @@ class TestSchemas:
         )
         assert output.overall_score == 65.0
         assert len(output.challenges) == 1
+        assert output.failed_roles == []
 
     def test_chat_request(self):
         """Test ChatRequest validation."""
-        req = ChatRequest(message="帮我分析一个需求")
-        assert req.message == "帮我分析一个需求"
+        req = ChatRequest(
+            message="继续生成 PRD",
+            workflow_context={
+                "original_requirement": "做一个 AI 简历优化器",
+                "decision_output": {"recommendation": "GO"},
+            },
+        )
+        assert req.message == "继续生成 PRD"
         assert req.phase == "auto"
+        assert req.workflow_context.original_requirement == "做一个 AI 简历优化器"
 
     def test_memory_search_request(self):
         """Test MemorySearchRequest validation."""
@@ -110,13 +120,39 @@ class TestWorkflow:
 
     def test_route_after_decision_clarify_or_continue(self):
         assert route_after_decision({"awaiting_clarification": True}) == "end"
-        assert route_after_decision({"requested_phase": "decision"}) == "end"
-        assert route_after_decision({"requested_phase": "auto"}) == "prd_writer"
-        assert route_after_decision({"requested_phase": "full_pipeline"}) == "prd_writer"
+        assert route_after_decision({"requested_phase": "decision"}) == "evaluator"
+        assert route_after_decision({
+            "requested_phase": "auto",
+            "decision_output": {"recommendation": "GO"},
+        }) == "prd_writer"
+        assert route_after_decision({
+            "requested_phase": "full_pipeline",
+            "decision_output": {"recommendation": "PIVOT"},
+        }) == "evaluator"
+        assert route_after_decision({
+            "requested_phase": "full_pipeline",
+            "decision_output": {"recommendation": "KILL"},
+        }) == "evaluator"
 
-    def test_route_after_critic(self):
-        assert route_after_critic({"skip_stress": True}) == "stress_test"
-        assert route_after_critic({"demo_mode": True}) == "stress_test"
+    def test_route_after_evaluator(self):
+        assert route_after_evaluator({"prd_output": "# PRD"}) == "stress_test"
+        assert route_after_evaluator({"prd_output": None}) == "end"
+        assert route_after_evaluator({}) == "end"
+
+    def test_stream_output_does_not_reemit_carried_artifacts(self):
+        carried_state = {
+            "decision_output": {"recommendation": "GO"},
+            "prd_output": "# Existing PRD",
+            "prd_revision": False,
+            "memory_citations": [],
+        }
+
+        assert build_node_output("orchestrator", carried_state) == {}
+        assert build_node_output("org_memory", carried_state) == {"citations": []}
+        assert build_node_output("prd_writer", carried_state) == {
+            "prd": "# Existing PRD",
+            "prd_revision": False,
+        }
 
 
 # ──────────────────────────────────────────────
@@ -133,8 +169,7 @@ class TestAgents:
         llm.ainvoke = AsyncMock()
         return llm
 
-    @pytest.mark.asyncio
-    async def test_decision_agent(self, mock_llm):
+    def test_decision_agent(self, mock_llm):
         """Test Decision Agent with mock LLM."""
         from app.agents.decision import DecisionAgent
         from langchain_core.messages import AIMessage
@@ -153,7 +188,7 @@ class TestAgents:
         mock_llm.bind = MagicMock(return_value=mock_llm)
 
         agent = DecisionAgent(llm=mock_llm)
-        result = await agent.analyze("Build a new feature")
+        result = asyncio.run(agent.analyze("Build a new feature"))
         assert result.recommendation == "GO"
         assert result.confidence == 0.9
 
@@ -210,8 +245,64 @@ class TestAgents:
         )
         assert decide["action"] == "decide"
 
-    @pytest.mark.asyncio
-    async def test_stress_test_agent(self, mock_llm):
+    def test_stress_parser_keeps_all_raw_json_issues(self):
+        from app.agents.stress_test import StressTestAgent
+
+        content = """{
+          "challenges": [
+            {
+              "challenge": "缺少成功指标",
+              "severity": "HIGH",
+              "suggestions": ["补充北极星指标"]
+            },
+            {
+              "challenge": "退出机制不清晰",
+              "severity": "medium",
+              "suggestions": "增加止损条件"
+            }
+          ]
+        }"""
+
+        issues = StressTestAgent._parse_challenge_response(content, "boss")
+
+        assert len(issues) == 2
+        assert issues[0].severity == "high"
+        assert issues[1].suggestions == ["增加止损条件"]
+
+    def test_stress_test_isolates_failed_role_and_dedupes(self):
+        from app.agents.stress_test import StressTestAgent, ROLE_NAMES
+
+        agent = StressTestAgent(llm=MagicMock())
+        duplicate = StressTestChallenge(
+            role="角色",
+            challenge="同一个问题",
+            severity="high",
+            suggestions=["修复"],
+        )
+        agent._challenge_from_role = AsyncMock(
+            side_effect=[
+                RuntimeError("role unavailable"),
+                [duplicate],
+                [duplicate.model_copy()],
+                [
+                    StressTestChallenge(
+                        role="角色",
+                        challenge="另一个问题",
+                        severity="low",
+                        suggestions=[],
+                    )
+                ],
+                [],
+            ]
+        )
+
+        result = asyncio.run(agent.run_stress_test("# PRD"))
+
+        assert len(result.challenges) == 2
+        assert result.failed_roles == [ROLE_NAMES["boss"]]
+        assert "未完成角色" in result.summary
+
+    def test_stress_test_agent(self, mock_llm):
         """Test Stress Test Agent with mock LLM."""
         from app.agents.stress_test import StressTestAgent
         from langchain_core.messages import AIMessage
@@ -223,6 +314,9 @@ class TestAgents:
 """)
 
         agent = StressTestAgent(llm=mock_llm)
-        result = await agent.run_stress_test("# Test PRD\nSome content here")
-        assert len(result.challenges) == 5  # One per role
+        result = asyncio.run(
+            agent.run_stress_test("# Test PRD\nSome content here")
+        )
+        assert mock_llm.ainvoke.await_count == 5  # All five roles still execute
+        assert len(result.challenges) == 1  # Identical findings are deduplicated
         assert result.overall_score >= 0

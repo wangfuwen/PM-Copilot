@@ -1,21 +1,33 @@
 """
 LangGraph Workflow — 核心 Multi-Agent 编排逻辑。
 
-Orchestrator → Org Memory → Decision(clarify|decide) → PRD → Critic → Stress → Writeback → END
+Orchestrator → Org Memory → Decision(clarify|decide) → PRD → Critic → Evaluator → Stress → Writeback → END
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, AsyncIterator
+from typing import Any, Optional, AsyncIterator, Callable, Awaitable
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
 from app.config import settings
+from app.telemetry import RunTelemetry, get_tracker, set_tracker
 
 logger = logging.getLogger(__name__)
+
+NODE_NAMES = {
+    "orchestrator",
+    "org_memory",
+    "decision",
+    "prd_writer",
+    "critic",
+    "evaluator",
+    "stress_test",
+    "memory_writeback",
+}
 
 
 class AgentState(TypedDict, total=False):
@@ -28,6 +40,7 @@ class AgentState(TypedDict, total=False):
     stress_test_results: Optional[list]
     stress_test_summary: Optional[dict]
     critic_feedback: Optional[dict]
+    evaluation: Optional[dict]
     org_memory_context: Optional[str]
     org_history_context: Optional[str]
     org_profile: Optional[dict]
@@ -37,10 +50,38 @@ class AgentState(TypedDict, total=False):
     memory_writeback_ids: Optional[list]
     next_agent: Optional[str]
     user_input: Optional[str]
+    original_requirement: Optional[str]
+    accepted_issues: Optional[list[str]]
+    prd_revision: Optional[bool]
     skip_clarify: Optional[bool]
     demo_mode: Optional[bool]
     skip_stress: Optional[bool]
     requested_phase: Optional[str]
+    last_agent_metrics: Optional[dict]
+
+
+def _instrument(name: str, fn: Callable[[AgentState], Awaitable[dict]]):
+    """Wrap a node to record duration / status on the active RunTelemetry."""
+
+    async def wrapped(state: AgentState) -> dict:
+        tracker = get_tracker()
+        if tracker:
+            tracker.begin(name)
+        try:
+            result = await fn(state)
+            metrics = tracker.end(name) if tracker else None
+            out = dict(result or {})
+            if metrics:
+                out["last_agent_metrics"] = metrics.to_dict()
+            return out
+        except Exception as e:
+            if tracker:
+                metrics = tracker.end(name, error=f"{type(e).__name__}: {e}")
+                # Re-raise so workflow surfaces error; metrics still available via tracker
+            raise
+
+    wrapped.__name__ = f"{name}_instrumented"
+    return wrapped
 
 
 def get_llm(agent_name: str = None, demo_mode: bool = False):
@@ -170,6 +211,27 @@ async def critic_node(state: AgentState) -> dict:
     return {**result, "messages": messages}
 
 
+async def evaluator_node(state: AgentState) -> dict:
+    from app.agents.evaluator import EvaluatorAgent
+
+    llm = get_llm("critic", demo_mode=bool(state.get("demo_mode")))
+    agent = EvaluatorAgent(llm=llm)
+    result = await agent(state)
+    evaluation = result.get("evaluation") or {}
+    messages = list(state.get("messages", []))
+    if evaluation.get("report"):
+        messages.append(
+            AIMessage(content=evaluation["report"], name="evaluator_agent")
+        )
+    logger.info(
+        "evaluator_node: target=%s overall=%s verdict=%s",
+        evaluation.get("target"),
+        evaluation.get("overall"),
+        evaluation.get("verdict"),
+    )
+    return {**result, "messages": messages}
+
+
 async def stress_test_node(state: AgentState) -> dict:
     from app.agents.stress_test import StressTestAgent
 
@@ -242,32 +304,38 @@ def route_after_org_memory(state: AgentState) -> str:
 def route_after_decision(state: AgentState) -> str:
     if state.get("awaiting_clarification"):
         return "end"
-    # Explicit "分析需求" stops after decision; auto / full_pipeline continues to PRD.
+    # Decision-only and non-GO decisions stop at the gate for user confirmation.
     requested = (state.get("requested_phase") or "auto").lower()
-    if requested in ("decision",):
-        return "end"
+    recommendation = ((state.get("decision_output") or {}).get("recommendation") or "").upper()
+    if requested == "decision" or recommendation in {"PIVOT", "KILL"}:
+        return "evaluator"
     return "prd_writer"
 
 
-def route_after_critic(state: AgentState) -> str:
-    # Always enter stress_test node; it may no-op in demo mode and emit a skip notice.
-    return "stress_test"
+def route_after_evaluator(state: AgentState) -> str:
+    """After scoring: PRD path continues to stress; decision-only ends."""
+    if state.get("prd_output"):
+        return "stress_test"
+    return "end"
 
 
 def build_workflow():
     """
     START → orchestrator → org_memory → [decision|prd|stress]
-      decision → (clarify END) | prd_writer → critic → stress|writeback → ...
+      decision → (clarify END) | evaluator | prd → critic → evaluator → stress → writeback
     """
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("orchestrator", orchestrator_node)
-    workflow.add_node("org_memory", org_memory_node)
-    workflow.add_node("decision", decision_node)
-    workflow.add_node("prd_writer", prd_writer_node)
-    workflow.add_node("critic", critic_node)
-    workflow.add_node("stress_test", stress_test_node)
-    workflow.add_node("memory_writeback", memory_writeback_node)
+    workflow.add_node("orchestrator", _instrument("orchestrator", orchestrator_node))
+    workflow.add_node("org_memory", _instrument("org_memory", org_memory_node))
+    workflow.add_node("decision", _instrument("decision", decision_node))
+    workflow.add_node("prd_writer", _instrument("prd_writer", prd_writer_node))
+    workflow.add_node("critic", _instrument("critic", critic_node))
+    workflow.add_node("evaluator", _instrument("evaluator", evaluator_node))
+    workflow.add_node("stress_test", _instrument("stress_test", stress_test_node))
+    workflow.add_node(
+        "memory_writeback", _instrument("memory_writeback", memory_writeback_node)
+    )
 
     workflow.set_entry_point("orchestrator")
     workflow.add_conditional_edges(
@@ -287,19 +355,67 @@ def build_workflow():
     workflow.add_conditional_edges(
         "decision",
         route_after_decision,
-        {"prd_writer": "prd_writer", "end": END},
+        {"prd_writer": "prd_writer", "evaluator": "evaluator", "end": END},
     )
     workflow.add_edge("prd_writer", "critic")
-    workflow.add_edge("critic", "stress_test")
+    workflow.add_edge("critic", "evaluator")
+    workflow.add_conditional_edges(
+        "evaluator",
+        route_after_evaluator,
+        {"stress_test": "stress_test", "end": END},
+    )
     workflow.add_edge("stress_test", "memory_writeback")
-    # Direct stress path (no PRD/critic)
-    # When routed straight to stress_test, still write back after
-    # already covered by stress → writeback edge
     workflow.add_edge("memory_writeback", END)
 
     app = workflow.compile()
     logger.info("Workflow compiled successfully")
     return app
+
+
+def build_node_output(node_name: str, state_update: Any) -> dict[str, Any]:
+    """Expose only artifacts produced by the completed node, not carried state."""
+    if not isinstance(state_update, dict):
+        return {}
+
+    output_data: dict[str, Any] = {}
+    if node_name == "decision":
+        if state_update.get("clarifying_questions"):
+            output_data["clarifying_questions"] = state_update[
+                "clarifying_questions"
+            ]
+            output_data["awaiting_clarification"] = True
+        if state_update.get("decision_output"):
+            output_data["decision"] = state_update["decision_output"]
+    elif node_name == "prd_writer":
+        if "prd_output" in state_update and state_update.get("prd_output") is not None:
+            output_data["prd"] = state_update["prd_output"]
+            output_data["prd_revision"] = bool(state_update.get("prd_revision"))
+    elif node_name == "critic" and state_update.get("critic_feedback"):
+        output_data["critic"] = state_update["critic_feedback"]
+    elif node_name == "evaluator" and state_update.get("evaluation"):
+        output_data["evaluation"] = state_update["evaluation"]
+    elif node_name == "stress_test" and "stress_test_results" in state_update:
+        output_data["stress_test"] = state_update["stress_test_results"]
+        output_data["stress_test_summary"] = state_update.get("stress_test_summary")
+    elif node_name == "memory_writeback" and "memory_writeback_ids" in state_update:
+        output_data["writeback_ids"] = state_update.get("memory_writeback_ids")
+
+    if node_name == "org_memory":
+        if "memory_citations" in state_update:
+            output_data["citations"] = state_update.get("memory_citations") or []
+        if state_update.get("memory_empty") is not None:
+            output_data["memory_empty"] = state_update.get("memory_empty")
+        if state_update.get("org_profile"):
+            profile = state_update["org_profile"]
+            output_data["org_profile_summary"] = {
+                "terminology": (profile.get("terminology") or {}).get("mapping", {}),
+                "lessons_count": len(profile.get("lessons_learned") or []),
+                "review_focus": (profile.get("review_focus") or {}).get(
+                    "top_3_dimensions", []
+                ),
+            }
+
+    return output_data
 
 
 async def run_workflow_streaming(
@@ -310,7 +426,9 @@ async def run_workflow_streaming(
     message_history: Optional[list] = None,
     demo_mode: bool = False,
     skip_clarify: bool = False,
+    resume_context: Optional[dict] = None,
 ) -> AsyncIterator[dict]:
+    resume_context = dict(resume_context or {})
     if message_history:
         initial_messages = list(message_history)
         if not initial_messages or not isinstance(initial_messages[-1], HumanMessage):
@@ -322,16 +440,23 @@ async def run_workflow_streaming(
         settings.demo_mode and settings.demo_skip_stress
     )
 
+    restored_prd = resume_context.get("prd_output")
+    if not restored_prd and (phase or "auto").lower() == "stress_test":
+        # Direct stress-test mode also accepts a pasted PRD as the current message.
+        if len((user_message or "").strip()) >= 100:
+            restored_prd = user_message
+
     initial_state: AgentState = {
         "messages": initial_messages,
         "current_phase": phase or "auto",
-        "decision_output": None,
+        "decision_output": resume_context.get("decision_output"),
         "clarifying_questions": None,
         "awaiting_clarification": False,
-        "prd_output": None,
+        "prd_output": restored_prd,
         "stress_test_results": None,
         "stress_test_summary": None,
         "critic_feedback": None,
+        "evaluation": None,
         "org_memory_context": None,
         "org_history_context": None,
         "org_profile": None,
@@ -341,64 +466,49 @@ async def run_workflow_streaming(
         "memory_writeback_ids": None,
         "next_agent": None,
         "user_input": user_message,
+        "original_requirement": resume_context.get("original_requirement") or user_message,
+        "accepted_issues": resume_context.get("accepted_issues") or [],
+        "prd_revision": False,
         "skip_clarify": skip_clarify,
         "demo_mode": demo_mode or settings.demo_mode,
         "skip_stress": skip_stress,
         "requested_phase": phase or "auto",
+        "last_agent_metrics": None,
     }
 
     executed_agents = set()
+    tracker = RunTelemetry()
+    set_tracker(tracker)
 
     try:
+        from datetime import datetime, timezone, timedelta
+
         async for event in workflow.astream(initial_state):
             for node_name, state_update in event.items():
+                if node_name not in NODE_NAMES:
+                    continue
                 logger.info("Workflow: Node '%s' completed", node_name)
+
+                metrics = None
+                if isinstance(state_update, dict):
+                    metrics = state_update.get("last_agent_metrics")
+                if not metrics and node_name in tracker.nodes:
+                    metrics = tracker.nodes[node_name].to_dict()
+
+                duration_ms = (metrics or {}).get("duration_ms") or 0
+                completed_at = datetime.now(timezone.utc)
+                started_at = completed_at - timedelta(milliseconds=duration_ms)
+
                 yield {
                     "type": "agent_start",
-                    "data": {"agent": node_name, "session_id": session_id},
+                    "data": {
+                        "agent": node_name,
+                        "session_id": session_id,
+                        "started_at": started_at.isoformat(),
+                    },
                 }
 
-                output_data: dict[str, Any] = {}
-                if state_update:
-                    if state_update.get("clarifying_questions"):
-                        output_data["clarifying_questions"] = state_update[
-                            "clarifying_questions"
-                        ]
-                        output_data["awaiting_clarification"] = True
-                    if "decision_output" in state_update and state_update.get(
-                        "decision_output"
-                    ):
-                        output_data["decision"] = state_update["decision_output"]
-                    if "prd_output" in state_update:
-                        output_data["prd"] = state_update["prd_output"]
-                    if "critic_feedback" in state_update and state_update.get(
-                        "critic_feedback"
-                    ):
-                        output_data["critic"] = state_update["critic_feedback"]
-                    if "stress_test_results" in state_update:
-                        output_data["stress_test"] = state_update["stress_test_results"]
-                        output_data["stress_test_summary"] = state_update.get(
-                            "stress_test_summary"
-                        )
-                    if "memory_citations" in state_update:
-                        output_data["citations"] = state_update.get("memory_citations") or []
-                    if state_update.get("memory_empty") is not None:
-                        output_data["memory_empty"] = state_update.get("memory_empty")
-                    if "org_profile" in state_update and state_update.get("org_profile"):
-                        profile = state_update["org_profile"]
-                        output_data["org_profile_summary"] = {
-                            "terminology": (profile.get("terminology") or {}).get(
-                                "mapping", {}
-                            ),
-                            "lessons_count": len(profile.get("lessons_learned") or []),
-                            "review_focus": (profile.get("review_focus") or {}).get(
-                                "top_3_dimensions", []
-                            ),
-                        }
-                    if "memory_writeback_ids" in state_update:
-                        output_data["writeback_ids"] = state_update.get(
-                            "memory_writeback_ids"
-                        )
+                output_data = build_node_output(node_name, state_update)
 
                 yield {
                     "type": "agent_output",
@@ -406,25 +516,39 @@ async def run_workflow_streaming(
                         "agent": node_name,
                         "output": output_data,
                         "session_id": session_id,
+                        "metrics": metrics,
                     },
                 }
                 yield {
                     "type": "agent_complete",
-                    "data": {"agent": node_name, "session_id": session_id},
+                    "data": {
+                        "agent": node_name,
+                        "session_id": session_id,
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat(),
+                        "metrics": metrics,
+                    },
                 }
                 executed_agents.add(node_name)
     except Exception as e:
-        logger.error("Workflow execution error: %s: %s", type(e).__name__, e, exc_info=True)
+        logger.error(
+            "Workflow execution error: %s: %s", type(e).__name__, e, exc_info=True
+        )
         yield {
             "type": "error",
             "data": f"工作流执行出错: {type(e).__name__}: {str(e)}",
         }
         return
+    finally:
+        set_tracker(None)
 
     yield {
         "type": "done",
         "data": {
             "session_id": session_id,
             "agents_executed": list(executed_agents),
+            "run_metrics": {a: m.to_dict() for a, m in tracker.nodes.items()},
+            "total_tokens": sum(m.total_tokens for m in tracker.nodes.values()),
+            "total_duration_ms": sum(m.duration_ms for m in tracker.nodes.values()),
         },
     }

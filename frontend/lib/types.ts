@@ -14,11 +14,28 @@ export type AgentName =
   | "prd_writer"
   | "stress_test"
   | "memory_writeback"
-  | "critic";
+  | "critic"
+  | "evaluator";
 
 export type AgentStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 
 export type WorkflowPhase = "idle" | "decision" | "prd_generation" | "stress_test" | "review" | "complete";
+
+export interface AgentTokenUsage {
+  prompt?: number;
+  completion?: number;
+  total?: number;
+}
+
+export interface AgentMetrics {
+  agent?: string;
+  duration_ms?: number;
+  tokens?: AgentTokenUsage;
+  retry_count?: number;
+  attempts?: number;
+  error?: string | null;
+  status?: string;
+}
 
 export interface AgentState {
   name: AgentName;
@@ -29,6 +46,10 @@ export interface AgentState {
   completedAt?: string;
   summary?: string;
   output?: AgentOutput;
+  metrics?: AgentMetrics;
+  durationMs?: number;
+  retryCount?: number;
+  tokens?: AgentTokenUsage;
 }
 
 export interface MemoryCitation {
@@ -70,15 +91,37 @@ export interface CriticFeedback {
   review?: string;
 }
 
+export interface EvaluationScores {
+  completeness?: number;
+  consistency?: number;
+  requirement_fit?: number;
+  clarity?: number;
+  actionability?: number;
+}
+
+export interface EvaluationResult {
+  target?: "decision" | "prd" | string;
+  scores?: EvaluationScores;
+  overall?: number;
+  verdict?: "STRONG" | "ADEQUATE" | "WEAK" | string;
+  highlights?: string[];
+  gaps?: string[];
+  summary?: string;
+  report?: string;
+  evaluated_at?: string;
+}
+
 export interface AgentOutput {
   decision?: DecisionOutput;
   prd?: string;
+  prd_revision?: boolean;
   stressTest?: StressTestChallenge[];
   stressTestSummary?: StressTestSummary;
   citations?: MemoryCitation[];
   clarifying_questions?: ClarifyStep;
   awaiting_clarification?: boolean;
   critic?: CriticFeedback;
+  evaluation?: EvaluationResult;
   memory_empty?: boolean;
   org_profile_summary?: {
     terminology?: Record<string, string>;
@@ -86,6 +129,13 @@ export interface AgentOutput {
     review_focus?: string[];
   };
   writeback_ids?: string[];
+}
+
+export interface WorkflowContext {
+  original_requirement?: string;
+  decision_output?: DecisionOutput;
+  prd_output?: string;
+  accepted_issues?: string[];
 }
 
 export interface MemoryChunk {
@@ -126,17 +176,24 @@ export interface DecisionOutput {
 // ──────────────────────────────────────────────
 
 export type Severity = "low" | "medium" | "high" | "critical";
+export type IssueStatus = "open" | "accepted" | "dismissed" | "applied";
 
 export interface StressTestChallenge {
+  id?: string;
   role: string;
   challenge: string;
   severity: Severity;
   suggestions: string[];
+  status?: IssueStatus;
 }
 
 export interface StressTestSummary {
-  overall_score: number;
+  overall_score: number | null;
   summary: string;
+  skipped?: boolean;
+  missing_prd?: boolean;
+  issue_count?: number;
+  failed_roles?: string[];
 }
 
 // ──────────────────────────────────────────────

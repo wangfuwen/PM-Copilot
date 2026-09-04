@@ -4,7 +4,14 @@
  * including SSE streaming for real-time agent updates.
  */
 
-import type { SSEEvent, MemoryResult, MemoryDoc, OrgProfile, MemoryChunk } from "./types";
+import type {
+  SSEEvent,
+  MemoryResult,
+  MemoryDoc,
+  OrgProfile,
+  MemoryChunk,
+  WorkflowContext,
+} from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 
@@ -12,6 +19,7 @@ export interface ChatOptions {
   demoMode?: boolean;
   skipClarify?: boolean;
   messageHistory?: { role: string; content: string }[];
+  workflowContext?: WorkflowContext;
   signal?: AbortSignal;
 }
 
@@ -34,6 +42,9 @@ export async function sendChatMessage(
   };
   if (options.messageHistory && options.messageHistory.length > 0) {
     payload.messages = options.messageHistory;
+  }
+  if (options.workflowContext) {
+    payload.workflow_context = options.workflowContext;
   }
 
   const response = await fetch(`${API_BASE}/chat`, {

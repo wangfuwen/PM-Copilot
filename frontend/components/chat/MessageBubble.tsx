@@ -4,12 +4,26 @@ import { cn } from "@/lib/utils";
 import { ClarifyOptions, SKIP_CLARIFY_TOKEN } from "./ClarifyOptions";
 import { MemoryCitationsBlock } from "./MemoryCitationsBlock";
 import { ContinuePrompt } from "./ContinuePrompt";
-import type { Message, ClarifyStep, MemoryCitation } from "@/lib/types";
+import { StressIssueList } from "./StressIssueList";
+import type {
+  Message,
+  ClarifyStep,
+  MemoryCitation,
+  IssueStatus,
+  StressTestChallenge,
+  StressTestSummary,
+} from "@/lib/types";
 
 interface MessageBubbleProps {
   message: Message;
   onClarifySelect?: (value: string) => void;
   onContinue?: (phase: string) => void;
+  onIssueStatusChange?: (
+    messageId: string,
+    issueIndex: number,
+    status: IssueStatus,
+  ) => void;
+  onApplyAcceptedIssues?: (messageId: string) => void;
   clarifyDisabled?: boolean;
 }
 
@@ -21,12 +35,15 @@ const AGENT_INFO: Record<string, { name: string; icon: string }> = {
   stress_test: { name: "压力测试", icon: "⚡" },
   memory_writeback: { name: "记忆回流", icon: "💾" },
   critic: { name: "质量审查", icon: "🔍" },
+  evaluator: { name: "Evaluation", icon: "📊" },
 };
 
 export function MessageBubble({
   message,
   onClarifySelect,
   onContinue,
+  onIssueStatusChange,
+  onApplyAcceptedIssues,
   clarifyDisabled,
 }: MessageBubbleProps) {
   const { role, content, agentName, timestamp, metadata } = message;
@@ -36,6 +53,11 @@ export function MessageBubble({
   const citations = (metadata?.citations as MemoryCitation[] | undefined) || undefined;
   const isCitationsMsg = metadata?.kind === "citations" || Boolean(citations?.length);
   const isContinueMsg = metadata?.kind === "continue_prompt";
+  const stressIssues =
+    (metadata?.stress_test as StressTestChallenge[] | undefined) || [];
+  const stressSummary = metadata?.stress_test_summary as
+    | StressTestSummary
+    | undefined;
   const isError = role === "system" && metadata?.kind !== "citations";
 
   const showClarify =
@@ -70,7 +92,43 @@ export function MessageBubble({
           ➡️
         </div>
         <div className="max-w-[80%] min-w-[280px]">
-          <ContinuePrompt onContinue={onContinue} disabled={clarifyDisabled} />
+          <ContinuePrompt
+            onContinue={onContinue}
+            disabled={clarifyDisabled}
+            recommendation={metadata?.recommendation as string | undefined}
+            hasPrd={Boolean(metadata?.has_prd)}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (
+    stressIssues.length > 0 &&
+    onIssueStatusChange &&
+    onApplyAcceptedIssues
+  ) {
+    return (
+      <div className="flex gap-3 justify-start">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-secondary text-sm">
+          ⚡
+        </div>
+        <div className="max-w-[88%] min-w-[320px] flex-1">
+          <StressIssueList
+            challenges={stressIssues}
+            summary={stressSummary}
+            disabled={clarifyDisabled}
+            onStatusChange={(index, status) =>
+              onIssueStatusChange(message.id, index, status)
+            }
+            onApplyAccepted={() => onApplyAcceptedIssues(message.id)}
+          />
+          <div className="mt-1 text-right text-xs text-muted-foreground opacity-50" suppressHydrationWarning>
+            {timestamp.toLocaleTimeString("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </div>
         </div>
       </div>
     );
@@ -99,6 +157,9 @@ export function MessageBubble({
         {agentInfo && (
           <div className="mb-1 text-xs font-medium text-muted-foreground">
             {agentInfo.icon} {agentInfo.name}
+            {agentName === "prd_writer" && metadata?.version
+              ? ` · v${metadata.version}${metadata.revised ? "（修订版）" : ""}`
+              : ""}
           </div>
         )}
 

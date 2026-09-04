@@ -60,9 +60,9 @@ class Settings(BaseSettings):
     # Demo / trial protection
     demo_mode: bool = Field(
         default=False,
-        description="Use cheaper models and skip stress test by default",
+        description="Use cheaper models while keeping the complete product workflow",
     )
-    demo_skip_stress: bool = Field(default=True, description="Skip stress test in demo mode")
+    demo_skip_stress: bool = Field(default=False, description="Optionally skip stress test in demo mode")
     rate_limit_per_ip_per_day: int = Field(
         default=20,
         description="Max /api/chat calls per IP per day (0 = disabled)",

@@ -62,6 +62,9 @@ async def lifespan(app: FastAPI):
     set_vector_store(vector_store)
     app.state.vector_store = vector_store
     app.state.workflow = build_workflow()
+    # Small bounded cache for phase-to-phase continuity. The browser also sends
+    # the latest structured artifacts so refreshes and backend restarts recover.
+    app.state.session_contexts = {}
     logger.info("✅ PM Copilot ready. Listening on http://%s:%s", settings.host, settings.port)
     yield
     logger.info("Shutting down PM Copilot...")
@@ -101,6 +104,19 @@ async def chat(request: ChatRequest, http_request: Request):
         )
 
     session_id = request.session_id or str(uuid.uuid4())
+
+    session_contexts: dict[str, dict] = app.state.session_contexts
+    resume_context = dict(session_contexts.get(session_id) or {})
+    if request.workflow_context:
+        resume_context.update(request.workflow_context.model_dump(exclude_none=True))
+    resume_context.setdefault("original_requirement", request.message)
+    if request.phase == "stress_test" and not resume_context.get("prd_output"):
+        if len(request.message.strip()) >= 100:
+            resume_context["prd_output"] = request.message
+
+    session_contexts[session_id] = resume_context
+    while len(session_contexts) > 200:
+        session_contexts.pop(next(iter(session_contexts)))
 
     message_history = None
     if request.messages:
@@ -143,7 +159,16 @@ async def chat(request: ChatRequest, http_request: Request):
                 message_history=message_history,
                 demo_mode=bool(request.demo_mode or settings.demo_mode),
                 skip_clarify=bool(request.skip_clarify),
+                resume_context=resume_context,
             ):
+                if event["type"] == "agent_output" and isinstance(event.get("data"), dict):
+                    output = event["data"].get("output") or {}
+                    if output.get("decision"):
+                        resume_context["decision_output"] = output["decision"]
+                    if output.get("prd"):
+                        resume_context["prd_output"] = output["prd"]
+                        resume_context["accepted_issues"] = []
+                    session_contexts[session_id] = dict(resume_context)
                 raw = event["data"]
                 data = (
                     raw
